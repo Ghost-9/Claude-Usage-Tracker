@@ -114,7 +114,8 @@ exit(1)
     /// Bash script that builds the statusline display.
     /// Installed to ~/.claude/statusline-command.sh and configured in Claude Code settings.json.
     /// Reads user preferences from ~/.claude/statusline-config.txt and displays selected components.
-    private let bashScript = """
+    // Not private: the statusline tests exercise the real script this installs.
+    let bashScript = """
 #!/bin/bash
 config_file="$HOME/.claude/statusline-config.txt"
 if [ -f "$config_file" ]; then
@@ -421,26 +422,73 @@ if [ "$show_context" = "1" ]; then
 fi
 
 usage_text=""
+
+# How old the Claude Usage app's cache may get before a reading is shown with its
+# age appended instead of being withheld. The app's refresh cadence is irregular
+# and has been observed running to tens of minutes between cache writes, so this
+# window is exceeded during ordinary use. The age is displayed so the number can
+# be judged rather than this threshold trusted.
+cache_stale_after=300
+
+# Render a cache age as a compact duration: 47s, 13m, 2h, 2h5m.
+format_cache_age() {
+  local seconds=$1
+
+  if [ "$seconds" -lt 60 ]; then
+    printf '%ds' "$seconds"
+  elif [ "$seconds" -lt 3600 ]; then
+    printf '%dm' "$((seconds / 60))"
+  else
+    local hours=$((seconds / 3600))
+    local minutes=$(((seconds % 3600) / 60))
+
+    if [ "$minutes" -eq 0 ]; then
+      printf '%dh' "$hours"
+    else
+      printf '%dh%dm' "$hours" "$minutes"
+    fi
+  fi
+}
+
+# Marker for a reading served from a cache older than cache_stale_after. Prints
+# nothing when the cache is fresh, so callers can append it unconditionally.
+# $1 = cache age in seconds, empty when the cache carried no timestamp.
+# $2 = colour to restore after the marker.
+cache_stale_marker() {
+  local age=$1 restore=$2
+
+  if [ -z "$age" ] || [ "$age" -lt "$cache_stale_after" ]; then
+    return
+  fi
+
+  if [ "$color_mode" = "monochrome" ]; then
+    printf ' (stale %s)' "$(format_cache_age "$age")"
+  else
+    printf ' %s⋯ %s%s%s' "$GRAY" "$(format_cache_age "$age")" "$RESET" "$restore"
+  fi
+}
+
 if [ "$show_usage" = "1" ]; then
-  # Try reading from cache first (written by Claude Usage app on each refresh)
+  # Read from the cache the Claude Usage app writes on each refresh. A reading
+  # older than cache_stale_after is still the most recent one available, so it
+  # is served with its age rather than dropped.
   cache_file="$HOME/.claude/.statusline-usage-cache"
   swift_result=""
+  usage_cache_age=""
   if [ -f "$cache_file" ]; then
     cache_ts=$(grep "^TIMESTAMP=" "$cache_file" 2>/dev/null | cut -d= -f2)
     now_ts=$(date +%s)
+    cache_util=$(grep "^UTILIZATION=" "$cache_file" | cut -d= -f2)
+    cache_reset=$(grep "^RESETS_AT=" "$cache_file" | cut -d= -f2)
     if [ -n "$cache_ts" ]; then
-      cache_age=$((now_ts - cache_ts))
-      if [ "$cache_age" -lt 300 ]; then
-        cache_util=$(grep "^UTILIZATION=" "$cache_file" | cut -d= -f2)
-        cache_reset=$(grep "^RESETS_AT=" "$cache_file" | cut -d= -f2)
-        if [ -n "$cache_util" ]; then
-          swift_result="${cache_util}|${cache_reset}"
-        fi
-      fi
+      usage_cache_age=$((now_ts - cache_ts))
+    fi
+    if [ -n "$cache_util" ]; then
+      swift_result="${cache_util}|${cache_reset}"
     fi
   fi
 
-  # Fall back to swift script if cache is stale or missing
+  # Fall back to swift script only when the cache is missing or carries no reading
   if [ -z "$swift_result" ]; then
     swift_result=$(swift "$HOME/.claude/fetch-claude-usage.swift" 2>/dev/null)
   fi
@@ -572,10 +620,12 @@ if [ "$show_usage" = "1" ]; then
         fi
       fi
 
+      usage_stale_marker=$(cache_stale_marker "$usage_cache_age" "$usage_color")
+
       if [ "$show_usage_label" = "1" ]; then
-        usage_text="${usage_color}Usage: ${utilization}%${progress_bar}${reset_time_display}${RESET}"
+        usage_text="${usage_color}Usage: ${utilization}%${progress_bar}${reset_time_display}${usage_stale_marker}${RESET}"
       else
-        usage_text="${usage_color}${utilization}%${progress_bar}${reset_time_display}${RESET}"
+        usage_text="${usage_color}${utilization}%${progress_bar}${reset_time_display}${usage_stale_marker}${RESET}"
       fi
     else
       if [ "$show_usage_label" = "1" ]; then
@@ -598,15 +648,14 @@ if [ "$show_weekly" = "1" ] && [ "$show_usage" = "1" ]; then
   cache_file="$HOME/.claude/.statusline-usage-cache"
   weekly_util=""
   weekly_reset=""
+  weekly_cache_age=""
   if [ -f "$cache_file" ]; then
     cache_ts=$(grep "^TIMESTAMP=" "$cache_file" 2>/dev/null | cut -d= -f2)
     now_ts=$(date +%s)
+    weekly_util=$(grep "^WEEKLY_UTILIZATION=" "$cache_file" | cut -d= -f2)
+    weekly_reset=$(grep "^WEEKLY_RESETS_AT=" "$cache_file" | cut -d= -f2)
     if [ -n "$cache_ts" ]; then
-      cache_age=$((now_ts - cache_ts))
-      if [ "$cache_age" -lt 300 ]; then
-        weekly_util=$(grep "^WEEKLY_UTILIZATION=" "$cache_file" | cut -d= -f2)
-        weekly_reset=$(grep "^WEEKLY_RESETS_AT=" "$cache_file" | cut -d= -f2)
-      fi
+      weekly_cache_age=$((now_ts - cache_ts))
     fi
   fi
 
@@ -723,10 +772,12 @@ if [ "$show_weekly" = "1" ] && [ "$show_usage" = "1" ]; then
       fi
     fi
 
+    weekly_stale_marker=$(cache_stale_marker "$weekly_cache_age" "$weekly_color")
+
     if [ "$show_weekly_label" = "1" ]; then
-      weekly_text="${weekly_color}Weekly: ${weekly_util}%${weekly_bar}${weekly_reset_display}${RESET}"
+      weekly_text="${weekly_color}Weekly: ${weekly_util}%${weekly_bar}${weekly_reset_display}${weekly_stale_marker}${RESET}"
     else
-      weekly_text="${weekly_color}${weekly_util}%${weekly_bar}${weekly_reset_display}${RESET}"
+      weekly_text="${weekly_color}${weekly_util}%${weekly_bar}${weekly_reset_display}${weekly_stale_marker}${RESET}"
     fi
   fi
 fi
@@ -737,16 +788,15 @@ if [ "$show_extra_usage" = "1" ] && [ "$show_usage" = "1" ]; then
   cost_used=""
   cost_limit=""
   cost_currency=""
+  extra_cache_age=""
   if [ -f "$cache_file" ]; then
     cache_ts=$(grep "^TIMESTAMP=" "$cache_file" 2>/dev/null | cut -d= -f2)
     now_ts=$(date +%s)
+    cost_used=$(grep "^COST_USED=" "$cache_file" | cut -d= -f2)
+    cost_limit=$(grep "^COST_LIMIT=" "$cache_file" | cut -d= -f2)
+    cost_currency=$(grep "^COST_CURRENCY=" "$cache_file" | cut -d= -f2)
     if [ -n "$cache_ts" ]; then
-      cache_age=$((now_ts - cache_ts))
-      if [ "$cache_age" -lt 300 ]; then
-        cost_used=$(grep "^COST_USED=" "$cache_file" | cut -d= -f2)
-        cost_limit=$(grep "^COST_LIMIT=" "$cache_file" | cut -d= -f2)
-        cost_currency=$(grep "^COST_CURRENCY=" "$cache_file" | cut -d= -f2)
-      fi
+      extra_cache_age=$((now_ts - cache_ts))
     fi
   fi
 
@@ -777,7 +827,8 @@ if [ "$show_extra_usage" = "1" ] && [ "$show_usage" = "1" ]; then
     if [ "$color_mode" = "perElement" ] && [ -n "$element_color_extra" ]; then
       cost_color=$(hex_to_ansi "$element_color_extra")
     fi
-    extra_usage_text="${cost_color}${cost_used} ${cost_currency}${RESET}"
+    extra_stale_marker=$(cache_stale_marker "$extra_cache_age" "$cost_color")
+    extra_usage_text="${cost_color}${cost_used} ${cost_currency}${extra_stale_marker}${RESET}"
   fi
 fi
 
